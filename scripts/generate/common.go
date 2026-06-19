@@ -296,7 +296,7 @@ func splitTypesByName(d APIDescription, typeNames []string) ([]TypeDescription, 
 }
 
 func isPseudoSubtype(d APIDescription, typeName string) bool {
-	if typeName == tgTypeString {
+	if _, ok := tgToGoTypeMap[typeName]; ok {
 		return true
 	}
 

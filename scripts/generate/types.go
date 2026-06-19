@@ -141,7 +141,12 @@ func enforceTypeAssertion(name string, subtypes []TypeDescription, pseudoSubtype
 
 func pseudoSubtypeName(parentType string, pseudoSubtype string) string {
 	if isTgArray(pseudoSubtype) {
-		return parentType + "Array"
+		elementType := strings.TrimPrefix(pseudoSubtype, "Array of ")
+		if elementType == parentType {
+			return parentType + "Array"
+		}
+
+		return parentType + elementType + "Array"
 	}
 
 	return parentType + pseudoSubtype
@@ -152,7 +157,7 @@ func generatePseudoSubtypeDefs(parentType string, pseudoSubtypes []string) strin
 	for _, subtype := range pseudoSubtypes {
 		name := pseudoSubtypeName(parentType, subtype)
 		if isTgArray(subtype) {
-			bd.WriteString(fmt.Sprintf("\n\ntype %s []%s", name, strings.TrimPrefix(subtype, "Array of ")))
+			bd.WriteString(fmt.Sprintf("\n\ntype %s %s", name, toGoType(subtype)))
 		} else {
 			bd.WriteString(fmt.Sprintf("\n\ntype %s %s", name, toGoType(subtype)))
 		}
@@ -466,11 +471,23 @@ func interfaceUnmarshalFunc(d APIDescription, tgType TypeDescription) (string, e
 		})
 	}
 
-	var primitiveStringType string
+	var primitiveSubtypes []primitiveSubtypeData
+	var numberSubtypes []primitiveSubtypeData
 	var arrayType string
 	for _, subtype := range pseudoSubtypes {
-		if subtype == tgTypeString {
-			primitiveStringType = pseudoSubtypeName(tgType.Name, subtype)
+		if _, ok := tgToGoTypeMap[subtype]; ok {
+			primitiveSubtype := primitiveSubtypeData{
+				TypeName:      pseudoSubtypeName(tgType.Name, subtype),
+				IsString:      subtype == tgTypeString,
+				IsBoolean:     subtype == tgTypeBoolean,
+				IsInteger:     subtype == tgTypeInteger,
+				IsFloat:       subtype == tgTypeFloat,
+				HasNumberCase: subtype == tgTypeInteger || subtype == tgTypeFloat,
+			}
+			primitiveSubtypes = append(primitiveSubtypes, primitiveSubtype)
+			if primitiveSubtype.HasNumberCase {
+				numberSubtypes = append(numberSubtypes, primitiveSubtype)
+			}
 		}
 		if isTgArray(subtype) {
 			arrayType = pseudoSubtypeName(tgType.Name, subtype)
@@ -479,12 +496,13 @@ func interfaceUnmarshalFunc(d APIDescription, tgType TypeDescription) (string, e
 
 	bd := strings.Builder{}
 	err = customStructUnmarshalTmpl.Execute(&bd, customStructUnmarshalData{
-		UnmarshalFuncName:   "unmarshal" + tgType.Name,
-		ParentType:          tgType.Name,
-		ConstantFieldName:   snakeToTitle(constantField),
-		CaseStatements:      cases,
-		PrimitiveStringType: primitiveStringType,
-		ArrayType:           arrayType,
+		UnmarshalFuncName: "unmarshal" + tgType.Name,
+		ParentType:        tgType.Name,
+		ConstantFieldName: snakeToTitle(constantField),
+		CaseStatements:    cases,
+		PrimitiveSubtypes: primitiveSubtypes,
+		NumberSubtypes:    numberSubtypes,
+		ArrayType:         arrayType,
 	})
 	if err != nil {
 		return "", fmt.Errorf("failed to generate interface unmarshaller: %w", err)
@@ -827,12 +845,22 @@ func (v *{{.Type}}) UnmarshalJSON(b []byte) error {
 `
 
 type customStructUnmarshalData struct {
-	UnmarshalFuncName   string
-	ParentType          string
-	ConstantFieldName   string
-	CaseStatements      []customStructUnmarshalCaseData
-	PrimitiveStringType string
-	ArrayType           string
+	UnmarshalFuncName string
+	ParentType        string
+	ConstantFieldName string
+	CaseStatements    []customStructUnmarshalCaseData
+	PrimitiveSubtypes []primitiveSubtypeData
+	NumberSubtypes    []primitiveSubtypeData
+	ArrayType         string
+}
+
+type primitiveSubtypeData struct {
+	TypeName      string
+	IsString      bool
+	IsBoolean     bool
+	IsInteger     bool
+	IsFloat       bool
+	HasNumberCase bool
 }
 
 type customStructUnmarshalCaseData struct {
@@ -876,14 +904,48 @@ func {{.UnmarshalFuncName}}(d json.RawMessage) ({{.ParentType}}, error) {
 		if len(d) == 0 || string(d) == "null" {
 			return nil, nil
 		}
-		{{ if .PrimitiveStringType }}
+		{{ range $primitive := .PrimitiveSubtypes }}
+		{{ if $primitive.IsString }}
 		if d[0] == '"' {
 			var s string
 			err := json.Unmarshal(d, &s)
 			if err != nil {
-				return nil, fmt.Errorf("failed to unmarshal {{.ParentType}} string: %w", err)
+				return nil, fmt.Errorf("failed to unmarshal {{$.ParentType}} string: %w", err)
 			}
-			return {{.PrimitiveStringType}}(s), nil
+			return {{$primitive.TypeName}}(s), nil
+		}
+		{{ end }}
+		{{ if $primitive.IsBoolean }}
+		if d[0] == 't' || d[0] == 'f' {
+			var b bool
+			err := json.Unmarshal(d, &b)
+			if err != nil {
+				return nil, fmt.Errorf("failed to unmarshal {{$.ParentType}} boolean: %w", err)
+			}
+			return {{$primitive.TypeName}}(b), nil
+		}
+		{{ end }}
+		{{ end }}
+		{{ if .NumberSubtypes }}
+		if d[0] == '-' || unicode.IsDigit(rune(0)) {
+			var n json.Number
+			err := json.Unmarshal(d, &n)
+			if err != nil {
+				return nil, fmt.Errorf("failed to unmarshal {{.ParentType}} number: %w", err)
+			}
+			{{ range $primitive := .NumberSubtypes }}
+			{{ if $primitive.IsInteger }}
+			if i, err := strconv.ParseInt(n.String(), 10, 64); err == nil {
+				return {{$primitive.TypeName}}(i), nil
+			}
+			{{ end }}
+			{{ if $primitive.IsFloat }}
+			if f, err := strconv.ParseFloat(n.String(), 64); err == nil {
+				return {{$primitive.TypeName}}(f), nil
+			}
+			{{ end }}
+			{{ end }}
+			return nil, fmt.Errorf("failed to unmarshal {{.ParentType}} number %q", n.String())
 		}
 		{{ end }}
 		{{ if .ArrayType }}
